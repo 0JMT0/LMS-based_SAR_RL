@@ -16,17 +16,17 @@ LMS-based background calibration for SAR ADCs with Q-learning–driven step-size
   - `.npy` save/load of Q-tables per comparator noise level (`sigma_cmp_lsb`).
 
 ## File Layout
-- `LMS-based_SAR_RL/lms_sar_rl.py` — main implementation, CLI, and demos.
-- `LMS-based_SAR_RL/README.md` — this guide.
+- `lms_sar_rl.py` — main implementation, CLI, and demos.
+- `README.md` — this guide.
 - Optional outputs (created by you):
-  - `LMS-based_SAR_RL/paper_logs.csv`, `LMS-based_SAR_RL/demo_logs.csv` — CSV logs.
-  - `LMS-based_SAR_RL/Q_sigma=<noise>.npy` — saved Q-table per noise level.
+  - `paper_logs.csv`, `demo_logs.csv` — CSV logs.
+  - `Q_sigma=<noise>.npy` — saved Q-table per noise level.
 
 ## Quick Start
 - Standard quick run:
-  - `python LMS-based_SAR_RL/lms_sar_rl.py`
+  - `python lms_sar_rl.py`
 - Paper-like grouped demo (50×10=500 episodes):
-  - `python LMS-based_SAR_RL/lms_sar_rl.py --paper-demo --groups 50 --per-group-episodes 10 --mismatch-sigma 0.05 --max-steps 250 --alpha 0.1 --gamma 0.8 --epsilon 0.5 --noise-levels 0.25 --csv LMS-based_SAR_RL/paper_logs.csv --save-qdir LMS-based_SAR_RL`
+  - `python lms_sar_rl.py --paper-demo --groups 50 --per-group-episodes 10 --mismatch-sigma 0.05 --max-steps 250 --alpha 0.1 --gamma 0.8 --epsilon 0.5 --noise-levels 0.25 --csv paper_logs.csv --save-qdir .`
 
 中文（簡）：啟用論文式示範，隨機生成 50 組 5% 失配，每組 10 次訓練（共 500 episodes），並輸出 CSV 與 Q-table。
 
@@ -93,9 +93,9 @@ Orientation
 
 ## Training Modes
 - Standard training
-  - Example: `python LMS-based_SAR_RL/lms_sar_rl.py --episodes 150 --max-steps 250 --alpha 0.1 --gamma 0.8 --epsilon 0.5`
+  - Example: `python lms_sar_rl.py --episodes 150 --max-steps 250 --alpha 0.1 --gamma 0.8 --epsilon 0.5`
 - Paper-like grouped training (recommended for reproducible benchmarking)
-  - Example: `python LMS-based_SAR_RL/lms_sar_rl.py --paper-demo --groups 50 --per-group-episodes 10 --mismatch-sigma 0.05 --noise-levels 0.25`
+  - Example: `python lms_sar_rl.py --paper-demo --groups 50 --per-group-episodes 10 --mismatch-sigma 0.05 --noise-levels 0.25`
   - Behavior: For each group, a fixed true weight (mismatch) is sampled and held constant across its episodes; the digital weight estimate is reinitialized per episode. This mimics running calibration across multiple dies with consistent mismatch per die.
 
 ## Output Summary
@@ -129,3 +129,37 @@ Each run prints a summary:
 ---
 
 If you need additional artifacts (plots of ENOB over episodes, saving action histograms, or multi-run aggregations), those can be added on request.
+
+## Quick Commands
+
+- Train (standard)
+  - `python lms_sar_rl.py --episodes 150 --max-steps 250 --noise-levels 0.25 --csv logs.csv --save-qdir .`
+- Train (paper-like 50×10)
+  - `python lms_sar_rl.py --paper-demo --groups 50 --per-group-episodes 10 --mismatch-sigma 0.05 --max-steps 250 --noise-levels 0.25 --csv paper_logs.csv --save-qdir .`
+- Load trained Q (summary + demo)
+  - `python lms_sar_rl.py --load-qdir . --noise-levels 0.25`
+
+### Inspect Q
+- Dump Q to CSV
+  - `python lms_sar_rl.py --load-qdir . --noise-levels 0.25 --dump-q-csv Q_sigma=0.25.csv`
+- Print selected rows (ASCII)
+  - `python lms_sar_rl.py --load-qdir . --noise-levels 0.25 --print-q 8.5,10.5,11.8`
+  - Range: `--print-q 8.0:12.1:0.5`
+
+### Per‑Step Trace (Iteration Details)
+- Trace with Dout bits (PN explicit)
+  - `python lms_sar_rl.py --episodes 3 --max-steps 80 --pn-explicit --corr-samples 256 --pn-amp 0.01 --trace-csv weight_trace.csv --noise-levels 0.25`
+- Trace with Dout bits + simulated N‑bit SAR code
+  - `python lms_sar_rl.py --episodes 1 --max-steps 3 --pn-explicit --trace-sar-code --sar-fixed 0.30 --trace-csv weight_trace.csv --noise-levels 0.25`
+
+### Multi‑Noise Tables
+- Train and save multiple sigma levels
+  - `python lms_sar_rl.py --episodes 150 --max-steps 250 --noise-levels 0.1,0.25,0.5 --save-qdir . --csv logs.csv`
+- Load multiple and dump
+  - `python lms_sar_rl.py --load-qdir . --noise-levels 0.1,0.25,0.5 --dump-q-csv Q_dump.csv`
+
+### Common Flags
+- Learning: `--alpha`, `--gamma`, `--epsilon`, `--seed`
+- Paper-like: `--groups`, `--per-group-episodes`, `--mismatch-sigma`
+- PN explicit: `--pn-explicit`, `--corr-samples`, `--pn-amp`
+- Outputs: `--csv`, `--save-qdir`, `--load-qdir`, `--dump-q-csv`, `--print-q`, `--trace-csv`, `--trace-sar-code`, `--sar-fixed`

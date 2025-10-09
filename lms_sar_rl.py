@@ -99,6 +99,7 @@ class SARADCEnv:
         corr_gain: float = 0.8,
         corr_noise_lsb: float = 0.02,
         rng: Optional[np.random.Generator] = None,
+        cal_bit: Optional[int] = None,
     ) -> None:
         self.n_bits = n_bits
         self.sigma_cmp_lsb = float(sigma_cmp_lsb)
@@ -108,6 +109,8 @@ class SARADCEnv:
         # Internal state
         self.true_weight = 1.0
         self.win = 1.0
+        # Which bit is being calibrated (index 0 = LSB). Default: middle bit.
+        self.cal_bit = int(cal_bit) if cal_bit is not None else max(0, min(n_bits - 1, n_bits // 2))
 
     def reset(self, mismatch_sigma: float = 0.01, win_init_sigma: float = 0.02, fixed_true_weight: Optional[float] = None) -> float:
         """Reset environment with random true mismatch and initial digital weight.
@@ -163,9 +166,90 @@ class SARADCEnv:
         enob = (snr_db - 1.76) / 6.02
         return float(enob)
 
+    def simulate_sar_code(self, x_norm: Optional[float] = None, use_true_weights: bool = True) -> Tuple[int, float]:
+        """Simulate an N-bit SAR conversion and return (code_int, x_norm).
+
+        - x_norm in [0,1]; if None uses RNG uniform.
+        - use_true_weights: if True, the calibrated bit weight is self.true_weight; otherwise ideal 1.0.
+        """
+        N = self.n_bits
+        rng = self.rng
+        x = float(rng.random()) if x_norm is None else float(x_norm)
+        # Input in LSB units (unipolar)
+        full_scale = (1 << N) - 1
+        x_lsb = x * full_scale
+
+        # Build weight factors per bit (LSB index 0)
+        factors = np.ones(N, dtype=float)
+        factors[self.cal_bit] = (self.true_weight if use_true_weights else 1.0)
+
+        code = 0
+        for j in range(N - 1, -1, -1):
+            trial = code | (1 << j)
+            # DAC in LSB units using true weights for comparator decisions
+            dac = 0.0
+            m = trial
+            k = 0
+            while m:
+                if m & 1:
+                    dac += (1 << k) * factors[k]
+                m >>= 1
+                k += 1
+            # Comparator (with noise)
+            resid = x_lsb - dac + rng.normal(0.0, self.sigma_cmp_lsb)
+            if resid >= 0.0:
+                code = trial
+        return code, x
+
+    # Explicit PN + re-quantizer correlation measurement for detailed tracing
+    def measure_correlation_explicit(self, win: float, samples: int = 256, pn_amp: float = 0.01) -> Tuple[float, float, float, np.ndarray]:
+        """Return (E_PN, dout_mean, rq_mean, dout_bits) using explicit PN and 1-bit re-quantizer.
+
+        PN sequence pn[n] in {+1, -1}; residue r[n] = (true-win) + pn_amp*pn[n] + noise;
+        re-quantizer rq[n] = sign(r[n]) in {+1, -1}; digital code Dout[n] = (rq[n] > 0) in {0,1}.
+        E_PN ≈ mean(pn[n] * rq[n]); dout_mean = mean(Dout); rq_mean = mean(rq).
+        """
+        rng = self.rng
+        pn = rng.choice([-1.0, 1.0], size=int(samples))
+        noise = rng.normal(0.0, self.sigma_cmp_lsb, size=int(samples))
+        resid = (self.true_weight - win) + pn_amp * pn + noise
+        rq = np.sign(resid)
+        rq[rq == 0.0] = 1.0
+        dout = (rq > 0).astype(float)
+        E_PN = float(np.mean(pn * rq))
+        dout_mean = float(np.mean(dout))
+        rq_mean = float(np.mean(rq))
+        return E_PN, dout_mean, rq_mean, dout
+
 
 def get_reward(st: int, stp1: int, R: np.ndarray) -> float:
     return float(R[st, stp1])
+
+
+class _TraceCSV:
+    def __init__(self, path: str, include_bits: bool = False, include_code: bool = False) -> None:
+        import csv, os
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        self._f = open(path, "w", newline="")
+        self._w = csv.writer(self._f)
+        self.include_bits = include_bits
+        self.include_code = include_code
+        self._w.writerow([
+            "mode", "sigma_cmp_lsb", "group", "episode", "ep_in_group", "step",
+            "state_before", "enob_before", "action", "step_value", "E_PN",
+            "dout_mean", "rq_mean", "dout_bits", "sar_code", "sar_x_norm",
+            "win_before", "win_after", "err_before", "err_after", "state_after",
+            "enob_after", "reward", "epsilon",
+        ])
+
+    def write(self, row: Tuple) -> None:
+        self._w.writerow(list(row))
+
+    def close(self) -> None:
+        try:
+            self._f.close()
+        except Exception:
+            pass
 
 
 def train_q_table(
@@ -175,6 +259,13 @@ def train_q_table(
     actions: np.ndarray,
     R: np.ndarray,
     seed: Optional[int] = None,
+    *,
+    pn_explicit: bool = False,
+    corr_samples: int = 256,
+    pn_amp: float = 0.01,
+    trace: Optional[_TraceCSV] = None,
+    trace_code: bool = False,
+    sar_fixed: Optional[float] = None,
 ) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
     """Train Q-table for LMS step-size selection via Q-learning.
 
@@ -210,8 +301,16 @@ def train_q_table(
             action_counts[at] += 1
 
             # 2) LMS calibration using measured correlation
-            E_PN = env.measure_correlation(win)
-            win_new = lms_calibration(win, step, E_PN)
+            if pn_explicit:
+                E_PN, dout_mean, rq_mean, dout_vec = env.measure_correlation_explicit(win, samples=corr_samples, pn_amp=pn_amp)
+            else:
+                E_PN = env.measure_correlation(win)
+                dout_mean, rq_mean = np.nan, np.nan
+                dout_vec = None
+            win_prev = win
+            enob_prev = enob
+            st_prev = st
+            win_new = lms_calibration(win_prev, step, E_PN)
 
             # 3) compute next ENOB and reward
             enob_new = env.compute_enob(win_new)
@@ -228,6 +327,52 @@ def train_q_table(
             st = stp1
 
             enob_sum += enob
+
+            # Trace row: standard mode
+            if trace is not None:
+                if getattr(trace, "include_bits", False) and dout_vec is not None:
+                    bits_list = ["1" if v > 0.5 else "0" for v in dout_vec.tolist()]
+                    # Group into bytes for readability: '01011010 11100011 ...'
+                    if len(bits_list) > 0:
+                        groups = ["".join(bits_list[i:i+8]) for i in range(0, len(bits_list), 8)]
+                        dout_bits_str = " ".join(groups)
+                    else:
+                        dout_bits_str = ""
+                else:
+                    dout_bits_str = ""
+                if getattr(trace, "include_code", False) and trace_code:
+                    sar_x = sar_fixed if sar_fixed is not None else env.rng.random()
+                    sar_code, x_norm = env.simulate_sar_code(x_norm=sar_x, use_true_weights=True)
+                else:
+                    sar_code, x_norm = "", ""
+                err_before = abs(win_prev - env.true_weight)
+                err_after = abs(win_new - env.true_weight)
+                trace.write((
+                    "standard",
+                    env.sigma_cmp_lsb,
+                    "",
+                    ep + 1,
+                    "",
+                    t + 1,
+                    st_prev,
+                    enob_prev,
+                    at,
+                    float(step),
+                    float(E_PN),
+                    float(dout_mean),
+                    float(rq_mean),
+                    dout_bits_str,
+                    sar_code,
+                    x_norm,
+                    float(win_prev),
+                    float(win_new),
+                    float(err_before),
+                    float(err_after),
+                    stp1,
+                    enob_new,
+                    float(rt),
+                    float(cfg.epsilon),
+                ))
 
             # Optional early stopping if near top ENOB and stable
             if st >= (S - 2):
@@ -263,6 +408,13 @@ def train_q_table_grouped(
     mismatch_sigma: float = 0.05,
     seed: Optional[int] = None,
     show_progress: bool = True,
+    *,
+    pn_explicit: bool = False,
+    corr_samples: int = 256,
+    pn_amp: float = 0.01,
+    trace: Optional[_TraceCSV] = None,
+    trace_code: bool = False,
+    sar_fixed: Optional[float] = None,
 ) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
     """Paper-like grouped training: 50 groups, each 10 episodes => 500 episodes.
 
@@ -305,8 +457,16 @@ def train_q_table_grouped(
                 step = actions[at]
                 action_counts[at] += 1
 
-                E_PN = env.measure_correlation(win)
-                win_new = lms_calibration(win, step, E_PN)
+                if pn_explicit:
+                    E_PN, dout_mean, rq_mean, dout_vec = env.measure_correlation_explicit(win, samples=corr_samples, pn_amp=pn_amp)
+                else:
+                    E_PN = env.measure_correlation(win)
+                    dout_mean, rq_mean = np.nan, np.nan
+                    dout_vec = None
+                win_prev = win
+                enob_prev = enob
+                st_prev = st
+                win_new = lms_calibration(win_prev, step, E_PN)
 
                 enob_new = env.compute_enob(win_new)
                 stp1 = enob_to_state_index(enob_new, enob_states)
@@ -319,6 +479,51 @@ def train_q_table_grouped(
                 enob = enob_new
                 st = stp1
                 enob_sum += enob
+
+                # Trace row: grouped mode
+                if trace is not None:
+                    if getattr(trace, "include_bits", False) and dout_vec is not None:
+                        bits_list = ["1" if v > 0.5 else "0" for v in dout_vec.tolist()]
+                        if len(bits_list) > 0:
+                            groups = ["".join(bits_list[i:i+8]) for i in range(0, len(bits_list), 8)]
+                            dout_bits_str = " ".join(groups)
+                        else:
+                            dout_bits_str = ""
+                    else:
+                        dout_bits_str = ""
+                    if getattr(trace, "include_code", False) and trace_code:
+                        sar_x = sar_fixed if sar_fixed is not None else env.rng.random()
+                        sar_code, x_norm = env.simulate_sar_code(x_norm=sar_x, use_true_weights=True)
+                    else:
+                        sar_code, x_norm = "", ""
+                    err_before = abs(win_prev - env.true_weight)
+                    err_after = abs(win_new - env.true_weight)
+                    trace.write((
+                        "grouped",
+                        env.sigma_cmp_lsb,
+                        g + 1,
+                        ep_idx + 1,
+                        k + 1,
+                        t + 1,
+                        st_prev,
+                        enob_prev,
+                        at,
+                        float(step),
+                        float(E_PN),
+                        float(dout_mean),
+                        float(rq_mean),
+                        dout_bits_str,
+                        sar_code,
+                        x_norm,
+                        float(win_prev),
+                        float(win_new),
+                        float(err_before),
+                        float(err_after),
+                        stp1,
+                        enob_new,
+                        float(rt),
+                        float(cfg.epsilon),
+                    ))
 
                 if st >= (S - 2):
                     break
@@ -538,6 +743,13 @@ if __name__ == "__main__":
     parser.add_argument("--mismatch-sigma", type=float, default=0.05, help="Mismatch sigma for true weight in paper-like demo")
     parser.add_argument("--dump-q-csv", type=str, default=None, help="Dump Q-table to CSV. If multiple noise levels, suffix _sigma=<val> is added or files are placed inside the given directory.")
     parser.add_argument("--print-q", type=str, default=None, help='Print Q rows. Accepts comma list (e.g., "8.5,10.5"), a range "8.0:12.1:0.5", or "all" (411 rows).')
+    parser.add_argument("--trace-csv", type=str, default=None, help="Record per-step iteration trace (incl. Dout and next weight) to CSV.")
+    parser.add_argument("--trace-dout", action="store_true", help="Include digital code Dout bits per step in the trace CSV (requires --pn-explicit).")
+    parser.add_argument("--pn-explicit", action="store_true", help="Use explicit PN + 1-bit re-quantizer to compute correlation (enables Dout logging).")
+    parser.add_argument("--corr-samples", type=int, default=256, help="Samples used to estimate correlation when --pn-explicit is on.")
+    parser.add_argument("--pn-amp", type=float, default=0.01, help="PN injection amplitude used in explicit correlation mode.")
+    parser.add_argument("--trace-sar-code", action="store_true", help="Simulate and record a full N-bit SAR code per step in the trace CSV.")
+    parser.add_argument("--sar-fixed", type=float, default=None, help="Normalized input in [0,1] for SAR code simulation; if omitted, uses random per step.")
     args = parser.parse_args()
 
     actions = build_action_set()
@@ -604,6 +816,23 @@ if __name__ == "__main__":
 
         t0 = time.time()
         logs: Dict[str, np.ndarray]
+        # Optional per-step trace
+        trace_logger = None
+        if args.trace_csv:
+            trace_path = args.trace_csv
+            import os
+            if len(noise_levels) > 1 and trace_path.lower().endswith(".csv"):
+                root, ext = os.path.splitext(trace_path)
+                trace_path = f"{root}_sigma={sigma:g}{ext}"
+            elif os.path.isdir(args.trace_csv):
+                trace_path = os.path.join(args.trace_csv, f"trace_sigma={sigma:g}.csv")
+            # include bits if explicitly requested or when PN explicit mode is used
+            trace_logger = _TraceCSV(
+                trace_path,
+                include_bits=(args.trace_dout or args.pn_explicit),
+                include_code=args.trace_sar_code,
+            )
+
         if Q is None:
             if args.paper_demo:
                 # paper-like grouped run: groups x per_group_episodes overrides episodes count
@@ -615,9 +844,24 @@ if __name__ == "__main__":
                     mismatch_sigma=args.mismatch_sigma,
                     seed=args.seed + i,
                     show_progress=True,
+                    pn_explicit=args.pn_explicit,
+                    corr_samples=args.corr_samples,
+                    pn_amp=args.pn_amp,
+                    trace=trace_logger,
+                    trace_code=args.trace_sar_code,
+                    sar_fixed=args.sar_fixed,
                 )
             else:
-                Q, logs = train_q_table(cfg, env, enob_states, actions, R, seed=args.seed + i)
+                Q, logs = train_q_table(
+                    cfg, env, enob_states, actions, R,
+                    seed=args.seed + i,
+                    pn_explicit=args.pn_explicit,
+                    corr_samples=args.corr_samples,
+                    pn_amp=args.pn_amp,
+                    trace=trace_logger,
+                    trace_code=args.trace_sar_code,
+                    sar_fixed=args.sar_fixed,
+                )
         else:
             # If loaded, we can still generate placeholder logs for the demo by running 1 eval episode
             # but here we just construct empty logs with zeros for consistency.
@@ -630,6 +874,9 @@ if __name__ == "__main__":
                 "action_counts": np.zeros(len(actions), dtype=int),
             }
         t1 = time.time()
+        if trace_logger is not None:
+            trace_logger.close()
+            print(f"Saved iteration trace to {trace_path}")
 
         print_summary(Q, logs, cfg, sigma=float(sigma), t0=t0, t1=t1)
 
